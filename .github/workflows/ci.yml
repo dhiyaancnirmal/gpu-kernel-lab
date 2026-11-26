@@ -1,0 +1,22 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+      - run: pip install -r requirements-ci.txt
+      - name: Point the build at pip's CUDA toolkit
+        run: |
+          CU=$(python -c "import nvidia, os; print(os.path.join(nvidia.__path__[0], 'cu13'))")
+          echo "NVCC=$CU/bin/nvcc" >> "$GITHUB_ENV"
+          echo "EXTRA_NVCCFLAGS=-I$CU/include -L$CU/lib" >> "$GITHUB_ENV"
+      # Compiles every kernel (warnings and spills are errors), runs the CPU tests,
+      # and checks the README tables against results/. GPU tests skip here; they
+      # run on the Modal GPU before results are committed.
+      - run: python -m pytest -v
