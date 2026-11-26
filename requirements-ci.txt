@@ -1,6 +1,7 @@
 # CPU-only CI: torch from the CPU index, plus a pip CUDA toolkit for the compile check.
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
+triton
 numpy
 matplotlib
 pytest

@@ -21,6 +21,10 @@ MATMUL_SIZES = [1024, 2048, 4096]
 SOFTMAX_SHAPES = [(4096, 256), (4096, 1024), (4096, 4096), (4096, 16384)]
 QUICK_MATMUL_SIZES = [512]
 QUICK_SOFTMAX_SHAPES = [(1024, 1024)]
+# Attention: batch 4, 16 heads, head_dim 64, fp16, sequence length varies.
+ATTN_BATCH, ATTN_HEADS, ATTN_DIM = 4, 16, 64
+ATTN_SEQS = [1024, 2048, 4096]
+QUICK_ATTN_SEQS = [512]
 
 # Norm-wise relative error, ||C - ref|| / ||ref||, against a float64 reference.
 FP32_TOL = 1e-5
@@ -112,6 +116,51 @@ def bench_softmax(shapes: list[tuple[int, int]], clock) -> list[dict]:
     return rows
 
 
+def bench_attention(seqs: list[int], clock) -> list[dict]:
+    import torch.nn.attention
+
+    from gkl.attention import attention, attention_flops
+
+    f = torch.nn.functional
+    rows = []
+    b, h, d = ATTN_BATCH, ATTN_HEADS, ATTN_DIM
+    for n in seqs:
+        for causal in (False, True):
+            gen = torch.Generator(device="cuda").manual_seed(n)
+            q, k, v = (torch.randn(b, h, n, d, device="cuda", dtype=torch.float16, generator=gen) for _ in range(3))
+            ref = f.scaled_dot_product_attention(q.float(), k.float(), v.float(), is_causal=causal)
+            mask = torch.ones(n, n, device="cuda", dtype=torch.bool).tril() if causal else None
+
+            def materialized():
+                s = (q @ k.transpose(-1, -2)) * d ** -0.5
+                if mask is not None:
+                    s = s.masked_fill(~mask, float("-inf"))
+                return torch.softmax(s, -1) @ v
+
+            def sdpa_flash():
+                with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
+                    return f.scaled_dot_product_attention(q, k, v, is_causal=causal)
+
+            cases = [("triton_fused", lambda: attention(q, k, v, causal=causal)),
+                     ("torch_sdpa_flash", sdpa_flash),
+                     ("torch_materialized", materialized)]
+            flops = attention_flops(b, h, n, d, causal)
+            for name, fn in cases:
+                err = (fn().float() - ref).abs().max().item()
+                t = measure(fn, clock)
+                rows.append({
+                    "kernel": name, "batch": b, "heads": h, "seq": n, "head_dim": d, "causal": causal,
+                    "dtype": "float16", "median_ms": t["median_ms"], "min_ms": t["min_ms"], "reps": t["reps"],
+                    "tflops": flops / (t["median_ms"] * 1e-3) / 1e12,
+                    "max_abs_err": err, "tolerance": 1e-2, "correct": err <= 1e-2,
+                })
+                print(f"attention n={n:5d} causal={causal!s:5} {name:18s} {t['median_ms']:8.3f} ms "
+                      f"{rows[-1]['tflops']:6.2f} TFLOP/s err {err:.1e}")
+            del q, k, v, ref
+            torch.cuda.empty_cache()
+    return rows
+
+
 def ceilings(env: dict, clock) -> dict:
     n = 64 * 1024 * 1024  # 256 MiB per buffer, far beyond any L2
     src = torch.randn(n, device="cuda")
@@ -141,10 +190,11 @@ def main() -> None:
         "ceilings": ceilings(env, clock),
         "matmul": bench_matmul(QUICK_MATMUL_SIZES if args.quick else MATMUL_SIZES, clock),
         "softmax": bench_softmax(QUICK_SOFTMAX_SHAPES if args.quick else SOFTMAX_SHAPES, clock),
+        "attention": bench_attention(QUICK_ATTN_SEQS if args.quick else ATTN_SEQS, clock),
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(result, indent=2) + "\n")
-    bad = [r["kernel"] for r in result["matmul"] + result["softmax"] if not r["correct"]]
+    bad = [r["kernel"] for r in result["matmul"] + result["softmax"] + result["attention"] if not r["correct"]]
     print(f"wrote {args.out}; incorrect: {bad or 'none'}")
     if bad:
         raise SystemExit(1)

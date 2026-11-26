@@ -31,6 +31,11 @@ SOFTMAX_LABELS = {
     "online": "2. Online softmax, float4",
     "torch": "`torch.softmax`",
 }
+ATTENTION_LABELS = {
+    "triton_fused": "Fused attention (Triton, this repo)",
+    "torch_sdpa_flash": "PyTorch SDPA, FlashAttention backend",
+    "torch_materialized": "PyTorch, materialized N x N scores",
+}
 
 
 def render(results: dict) -> str:
@@ -70,7 +75,21 @@ def render(results: dict) -> str:
         cells = [f"{by[(k, r, c)]['gbps']:.0f}" for r, c in shapes]
         out.append(f"| {SOFTMAX_LABELS.get(k, k)} | " + " | ".join(cells) + " |")
     out.append("")
-    ok = all(r["correct"] for r in mm + sm)
+    at = results.get("attention", [])
+    if at:
+        cfgs = list(dict.fromkeys((r["seq"], r["causal"]) for r in at))
+        by = {(r["kernel"], r["seq"], r["causal"]): r for r in at}
+        r0 = at[0]
+        out.append(f"**Attention forward, {r0['dtype']}, batch {r0['batch']}, {r0['heads']} heads, head_dim "
+                   f"{r0['head_dim']}, TFLOP/s** (columns are sequence length; higher is better)")
+        out.append("")
+        out.append("| Kernel | " + " | ".join(f"{n}{' causal' if c else ''}" for n, c in cfgs) + " |")
+        out.append("|---|" + "---:|" * len(cfgs))
+        for k in dict.fromkeys(r["kernel"] for r in at):
+            cells = [f"{by[(k, n, c)]['tflops']:.1f}" if (k, n, c) in by else "-" for n, c in cfgs]
+            out.append(f"| {ATTENTION_LABELS.get(k, k)} | " + " | ".join(cells) + " |")
+        out.append("")
+    ok = all(r["correct"] for r in mm + sm + at)
     out.append(f"Correctness against a float64 PyTorch reference: {'all kernels pass' if ok else 'FAILURES, see results file'}.")
     return "\n".join(out)
 
